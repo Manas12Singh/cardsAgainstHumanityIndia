@@ -6,7 +6,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # CONFIG
 TELEGRAM_BOT_TOKEN = "7733457427:AAHcsg3vHmpwc75_3oxLhw48M77Rs6U0nTc"
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = "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"
 
 # Set up OpenAI API
 openai.api_key = OPENAI_API_KEY
