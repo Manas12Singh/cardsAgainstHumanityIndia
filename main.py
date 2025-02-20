@@ -1,178 +1,259 @@
-import openai
-import random
+import os
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
+import openai
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-# CONFIG
-TELEGRAM_BOT_TOKEN = "7733457427:AAHcsg3vHmpwc75_3oxLhw48M77Rs6U0nTc"
-OPENAI_API_KEY = "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"
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Set up OpenAI API
+# Set your API keys (or load them from environment variables)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # e.g., "sk-..."
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # e.g., "123456:ABC-..."
+
 openai.api_key = OPENAI_API_KEY
 
-# Game Data
-games = {}
+# --- Game State Classes ---
+# This is a simple in-memory game manager. In production, you may want to use persistent storage.
 
-# Enable logging
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+games = {}  # key: chat_id, value: GameSession instance
 
-async def generate_question():
-    """Generate a 'Chats Against Humanity' style question using ChatGPT"""
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "system", "content": "Generate a funny, dark, or controversial 'Chats Against Humanity' question for an Indian audience."}]
+class GameSession:
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
+        self.players = {}       # user_id -> player name
+        self.scores = {}        # user_id -> score (int)
+        self.round = 0
+        self.current_black_card = None
+        self.submissions = {}   # user_id -> submitted answer
+        self.judge_order = []   # list of user_ids (order of joining)
+        self.current_judge = None
+
+    def add_player(self, user_id, name):
+        if user_id not in self.players:
+            self.players[user_id] = name
+            self.scores[user_id] = 0
+            self.judge_order.append(user_id)
+
+    def remove_player(self, user_id):
+        if user_id in self.players:
+            del self.players[user_id]
+            del self.scores[user_id]
+            if user_id in self.judge_order:
+                self.judge_order.remove(user_id)
+            if self.current_judge == user_id:
+                self.current_judge = None
+
+    def next_judge(self):
+        if not self.judge_order:
+            self.current_judge = None
+        else:
+            if self.current_judge is None:
+                self.current_judge = self.judge_order[0]
+            else:
+                idx = self.judge_order.index(self.current_judge)
+                self.current_judge = self.judge_order[(idx + 1) % len(self.judge_order)]
+        return self.current_judge
+
+    def start_round(self):
+        self.round += 1
+        self.submissions = {}
+        self.current_black_card = None
+
+    def submit_answer(self, user_id, answer):
+        self.submissions[user_id] = answer
+
+    def set_winner(self, user_id):
+        if user_id in self.scores:
+            self.scores[user_id] += 1
+
+# --- Bot Command Handlers ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    help_text = (
+        "Welcome to Cards Against Humanity India Edition Bot!\n\n"
+        "Commands:\n"
+        "/startgame - Start a new game session\n"
+        "/join - Join the current game\n"
+        "/leave - Leave the game\n"
+        "/question - Generate a new question (black card) for this round\n"
+        "/submit <your answer> - Submit your answer (white card)\n"
+        "/judge <player name> - (Judge only) Pick a winning answer\n"
+        "/score - Show current scores\n"
+        "/help - Show this help message"
     )
-    return response["choices"][0]["message"]["content"]
+    await update.message.reply_text(help_text)
 
-async def generate_answer(question):
-    """Generate a witty or sarcastic answer using ChatGPT"""
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "system", "content": f"Generate a witty or outrageous answer to the question: '{question}' for an Indian audience."}]
-    )
-    return response["choices"][0]["message"]["content"]
-
-async def start(update: Update, context: CallbackContext):
-    """Start the bot and welcome users."""
-    await update.message.reply_text("Welcome to *Chats Against Humanity - India Edition*! 🎭\n"
-                                    "Use /newgame to start a new game.", parse_mode="Markdown")
-
-async def new_game(update: Update, context: CallbackContext):
-    """Start a new game session."""
-    chat_id = update.message.chat_id
+async def startgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
     if chat_id in games:
-        await update.message.reply_text("A game is already in progress! Use /endgame to stop it.")
-        return
-    
-    games[chat_id] = {
-        "players": set(),
-        "judge": None,
-        "question": None,
-        "answers": {},
-        "scores": {}
-    }
-    
-    await update.message.reply_text("New game started! Players, type /join to participate.")
+        await update.message.reply_text("A game is already running in this chat.")
+    else:
+        games[chat_id] = GameSession(chat_id)
+        await update.message.reply_text("New game started! Players, use /join to participate.")
 
-async def join(update: Update, context: CallbackContext):
-    """Allow players to join the game."""
-    chat_id = update.message.chat_id
-    user_id = update.message.from_user.id
-    username = update.message.from_user.first_name
-    
+async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user = update.effective_user
     if chat_id not in games:
-        await update.message.reply_text("No active game. Start one with /newgame.")
+        await update.message.reply_text("No game is running. Use /startgame to begin a game.")
+    else:
+        game = games[chat_id]
+        game.add_player(user.id, user.first_name)
+        await update.message.reply_text(f"{user.first_name} has joined the game!")
+
+async def leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    if chat_id not in games:
+        await update.message.reply_text("No game is running.")
+    else:
+        game = games[chat_id]
+        game.remove_player(user.id)
+        await update.message.reply_text(f"{user.first_name} has left the game.")
+
+async def question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate a new black card (question) for the current round."""
+    chat_id = update.effective_chat.id
+    if chat_id not in games:
+        await update.message.reply_text("No game is running. Use /startgame to begin.")
         return
-    
-    games[chat_id]["players"].add(user_id)
-    games[chat_id]["scores"].setdefault(user_id, 0)
-    
-    await update.message.reply_text(f"{username} has joined the game! 🎉")
-
-async def start_round(update: Update, context: CallbackContext):
-    """Start a round with a generated question."""
-    chat_id = update.message.chat_id
-    game = games.get(chat_id)
-    
-    if not game or len(game["players"]) < 3:
-        await update.message.reply_text("You need at least 3 players to start. Use /join to join the game.")
+    game = games[chat_id]
+    if len(game.players) < 3:
+        await update.message.reply_text("At least 3 players are needed to start a round.")
         return
+    game.start_round()
+    # Determine the judge for this round (rotate order)
+    judge_id = game.next_judge()
+    judge_name = game.players.get(judge_id, "Unknown")
+    # Use OpenAI ChatGPT to generate a black card
+    prompt = (
+        "Generate a witty, edgy, and culturally relevant Cards Against Humanity question card "
+        "for an Indian audience. The question should be humorous and slightly irreverent."
+    )
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=50,
+            temperature=0.7
+        )
+        black_card = response['choices'][0]['message']['content'].strip()
+        game.current_black_card = black_card
+        await update.message.reply_text(
+            f"Round {game.round}!\nBlack card: {black_card}\nJudge for this round: {judge_name}",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error("Error generating black card: %s", e)
+        await update.message.reply_text("Failed to generate a question card. Please try again later.")
 
-    # Pick a random judge
-    game["judge"] = random.choice(list(game["players"]))
-    
-    # Generate a question
-    game["question"] = await generate_question()
-    
-    # Clear previous answers
-    game["answers"] = {}
-    
-    await update.message.reply_text(f"🃏 Question: *{game['question']}*\n\n"
-                                    f"Send your answer *privately* to me!", parse_mode="Markdown")
-
-async def answer(update: Update, context: CallbackContext):
-    """Players submit answers privately."""
-    chat_id = update.message.chat_id
-    user_id = update.message.from_user.id
-    text = update.message.text
-    
-    for game_id, game in games.items():
-        if user_id in game["players"] and user_id != game["judge"]:
-            game["answers"][user_id] = text
-            await update.message.reply_text("✅ Your answer has been submitted!")
-            return
-    
-    await update.message.reply_text("You're not in an active game or you're the judge!")
-
-async def reveal_answers(update: Update, context: CallbackContext):
-    """Reveal answers anonymously and let the judge choose the best one."""
-    chat_id = update.message.chat_id
-    game = games.get(chat_id)
-
-    if not game or not game["answers"]:
-        await update.message.reply_text("No answers submitted yet!")
+async def submit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    if chat_id not in games:
+        await update.message.reply_text("No game is running.")
         return
-
-    # Shuffle and create answer choices
-    shuffled_answers = list(game["answers"].items())
-    random.shuffle(shuffled_answers)
-
-    keyboard = [
-        [InlineKeyboardButton(f"Answer {i+1}", callback_data=str(user_id))]
-        for i, (user_id, _) in enumerate(shuffled_answers)
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    game["shuffled_answers"] = shuffled_answers
-
-    await update.message.reply_text("🃏 Here are the answers:\n\n" +
-                                    "\n".join([f"🔹 Answer {i+1}" for i in range(len(shuffled_answers))]),
-                                    reply_markup=reply_markup)
-
-async def choose_winner(update: Update, context: CallbackContext):
-    """Judge selects the best answer."""
-    query = update.callback_query
-    chat_id = query.message.chat_id
-    game = games.get(chat_id)
-
-    if not game or query.from_user.id != game["judge"]:
-        await query.answer("You're not the judge!")
+    game = games[chat_id]
+    if game.current_black_card is None:
+        await update.message.reply_text("No active round. Use /question to get a question card.")
         return
-
-    winner_id = int(query.data)
-    game["scores"][winner_id] += 1
-    winner_name = query.from_user.first_name
-
-    await query.message.edit_text(f"🎉 {winner_name} won this round! They now have {game['scores'][winner_id]} points.")
-
-async def end_game(update: Update, context: CallbackContext):
-    """End the game and show final scores."""
-    chat_id = update.message.chat_id
-    game = games.pop(chat_id, None)
-
-    if not game:
-        await update.message.reply_text("No active game to end!")
+    answer = " ".join(context.args)
+    if not answer:
+        await update.message.reply_text("Please use /submit followed by your answer.")
         return
+    if user.id == game.current_judge:
+        await update.message.reply_text("The judge cannot submit an answer.")
+        return
+    game.submit_answer(user.id, answer)
+    await update.message.reply_text(f"{user.first_name}'s answer submitted.")
 
-    scores = "\n".join([f"{context.bot.get_chat(user_id).first_name}: {score}" for user_id, score in game["scores"].items()])
-    await update.message.reply_text(f"🏆 Game over! Final scores:\n\n{scores}")
+async def judge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Judge the round by selecting the winning submission."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    if chat_id not in games:
+        await update.message.reply_text("No game is running.")
+        return
+    game = games[chat_id]
+    if user.id != game.current_judge:
+        await update.message.reply_text("Only the current judge can pick a winner.")
+        return
+    if not game.submissions:
+        await update.message.reply_text("No submissions to judge this round.")
+        return
+    # If no argument is provided, list all submissions
+    if not context.args:
+        submission_list = "\n".join(
+            f"{game.players.get(uid, 'Unknown')}: {ans}" for uid, ans in game.submissions.items()
+        )
+        await update.message.reply_text(
+            "Submissions:\n" + submission_list + "\n\nJudge, please use /judge <player name> to select a winner."
+        )
+        return
+    selected_name = " ".join(context.args).lower()
+    winner_id = None
+    for uid, name in game.players.items():
+        if name.lower() == selected_name and uid in game.submissions:
+            winner_id = uid
+            break
+    if winner_id is None:
+        await update.message.reply_text("Could not find a submission by that player. Check the names and try again.")
+        return
+    game.set_winner(winner_id)
+    await update.message.reply_text(f"{game.players[winner_id]} wins this round!")
+    # Prepare for next round by rotating the judge
+    game.next_judge()
 
-def main():
-    """Start the bot."""
+async def score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if chat_id not in games:
+        await update.message.reply_text("No game is running.")
+        return
+    game = games[chat_id]
+    if not game.scores:
+        await update.message.reply_text("No scores yet.")
+        return
+    score_text = "\n".join(f"{name}: {score}" for uid, (name, score) in zip(game.players.keys(), zip(game.players.values(), game.scores.values())))
+    await update.message.reply_text("Current scores:\n" + score_text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    help_text = (
+        "Available Commands:\n"
+        "/startgame - Start a new game session\n"
+        "/join - Join the current game\n"
+        "/leave - Leave the game\n"
+        "/question - Generate a new question card (black card)\n"
+        "/submit <your answer> - Submit your answer (white card)\n"
+        "/judge <player name> - Judge the round (only the current judge can use this)\n"
+        "/score - Display the current scores\n"
+        "/help - Show this help message"
+    )
+    await update.message.reply_text(help_text)
+
+# --- Main Function to Run the Bot ---
+def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
+    # Register command handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("newgame", new_game))
+    app.add_handler(CommandHandler("startgame", startgame))
     app.add_handler(CommandHandler("join", join))
-    app.add_handler(CommandHandler("startround", start_round))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, answer))
-    app.add_handler(CommandHandler("reveal", reveal_answers))
-    app.add_handler(CallbackQueryHandler(choose_winner))
-    app.add_handler(CommandHandler("endgame", end_game))
-
-    print("Bot is running...")
+    app.add_handler(CommandHandler("leave", leave))
+    app.add_handler(CommandHandler("question", question))
+    app.add_handler(CommandHandler("submit", submit))
+    app.add_handler(CommandHandler("judge", judge))
+    app.add_handler(CommandHandler("score", score))
+    app.add_handler(CommandHandler("help", help_command))
+    # Run the bot (polling)
     app.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
