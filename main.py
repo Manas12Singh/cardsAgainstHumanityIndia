@@ -7,6 +7,9 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Set up logging
 logging.basicConfig(
